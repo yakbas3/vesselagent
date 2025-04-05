@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+google-generativeai
+# Add database driver (e.g., asyncpg for PostgreSQL or motor for MongoDB)
+# Add AI library (e.g., google-generativeai) 
