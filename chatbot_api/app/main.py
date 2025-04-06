@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 import os
 import uuid
 import logging
+from typing import List, Tuple, Optional
+import json
+import pandas as pd
 
 # Load environment variables from .env file BEFORE importing other modules
 load_dotenv()
@@ -12,9 +15,8 @@ load_dotenv()
 # Now import modules that might depend on environment variables (like state which initializes Gemini)
 from app.api.endpoints import chat as chat_router
 from app.core.config import settings
-from app.state import chat_histories, model
+from app.state import chat_histories, model, user_data_df, date_col_found, user_data_summary
 from app import schemas
-from app.services.chat_service import call_gemini_api
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -29,61 +31,201 @@ app = FastAPI(title="Hackathon Health Chatbot API (Web UI)", version="0.3.0")
 
 # --- Mount Static Files Directory ---
 # Serve files from the 'static' directory under the '/static' URL path
-# The directory path is relative to where uvicorn is run.
-# Since we run from inside 'chatbot_api', the path is just 'static'.
+# Ensure the 'static' directory exists at the same level as this main.py or adjust path
+# IMPORTANT: Create the 'static' folder in the 'chatbot_api' directory
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# --- Updated Gemini API Call Logic (moved from service for simplicity here) ---
-MAX_HISTORY_LENGTH = 20 # Defined here, was 20 turns
+# --- System Prompt Definition ---
+SYSTEM_PROMPT = (
+    "You are a helpful and knowledgeable health assistant. "
+    "Your goal is to analyze the user's biomarker data and conversation history to answer questions, identify trends, and provide concise, data-driven insights. "
+    "For questions about specific data points (e.g., metrics on a certain date), relevant data will be retrieved and provided in the context prefixed with \'Specifically retrieved data...\'. "
+    "You MUST prioritize and use this specifically retrieved data to answer the question it pertains to. State the data found clearly in your answer. "
+    "If the retrieved information indicates \'No data found\' or an error, explain that to the user. "
+    "If no specific data is retrieved for the query, you can use the general data summary (if provided previously) or state that you need more information or cannot answer from the summary alone. "
+    "Focus on accuracy. Do not provide medical diagnoses. Be friendly."
+)
+# ------------------------------
+
+# --- Helper Function for LLM-based Data Querying --- 
+def query_user_data_with_llm(user_query: str, df_columns: List[str]) -> Tuple[Optional[str], bool]:
+    """
+    Uses the LLM to parse the user query and executes a predefined, safe query.
+    Returns a tuple: (formatted result string or info message, is_actual_data_found)
+    is_actual_data_found is True only if specific rows were successfully retrieved.
+    """
+    is_actual_data_found = False # Flag to track if we got real data vs info message
+    if user_data_df is None or date_col_found is None:
+        logger.info("query_user_data_with_llm: DataFrame or date column not available.")
+        return ("Data source is not loaded or has no date column.", is_actual_data_found)
+    
+    if not model:
+        logger.error("query_user_data_with_llm: Gemini model not available for parsing.")
+        return ("Error: Could not parse query because the AI model is unavailable.", is_actual_data_found)
+
+    parsing_prompt = f"""
+    Analyze the user query about health data. Columns: {df_columns}. Date column: '{date_col_found}'.
+    Extract: metric (column name), date (YYYY-MM-DD), query_type ('lookup', 'average', 'other').
+    Query: "{user_query}"
+    Return ONLY JSON: {{"metric": "...", "date": "...", "query_type": "..."}} (use null if not found).
+    Standardize date found to YYYY-MM-DD.
+    JSON response:
+    """
+
+    logger.info(f"Sending query to LLM for parsing: {user_query}")
+    parsed_params = None
+    try:
+        parsing_response = model.generate_content(parsing_prompt)
+        llm_output = parsing_response.text.strip()
+        logger.info(f"LLM parsing response: {llm_output}")
+        
+        if llm_output.startswith("```json"):
+            llm_output = llm_output.strip("`json\n \t")
+        elif llm_output.startswith("```"):
+             llm_output = llm_output.strip("`\n \t")
+             
+        parsed_params = json.loads(llm_output)
+        parsed_params = {
+            "metric": parsed_params.get("metric"),
+            "date": parsed_params.get("date"),
+            "query_type": parsed_params.get("query_type")
+        }
+        
+    except json.JSONDecodeError:
+        logger.warning(f"LLM response was not valid JSON: {llm_output}")
+        return ("I had trouble understanding the structure of your request for data.", is_actual_data_found)
+    except Exception as e:
+        logger.error(f"Error during LLM query parsing: {e}")
+        return ("An error occurred while trying to understand your data request.", is_actual_data_found)
+
+    # --- Execute Predefined Query --- 
+    query_type = parsed_params.get("query_type")
+    metric = parsed_params.get("metric")
+    date_str = parsed_params.get("date")
+
+    if query_type == "lookup" and date_str: # Allow lookup even without specific metric (show whole row)
+        logger.info(f"Executing lookup for metric '{metric or 'all'}' on date '{date_str}'")
+        try:
+            query_date = pd.to_datetime(date_str)
+            mask = user_data_df[date_col_found].dt.date == query_date.date()
+            results_df = user_data_df[mask]
+
+            if not results_df.empty:
+                # If a specific metric was requested and exists, select it
+                if metric and metric in results_df.columns:
+                    results_df = results_df[[date_col_found, metric]]
+                elif metric: # Metric requested but not found
+                     return (f"I found data for {query_date.strftime('%Y-%m-%d')}, but the specific metric '{metric}' wasn't in the columns: {list(user_data_df.columns)}", is_actual_data_found)
+
+                result_string = f"Data found for {query_date.strftime('%Y-%m-%d')}:\n"
+                result_string += results_df.to_string(index=False)
+                is_actual_data_found = True # Mark that we found data rows
+                return (result_string, is_actual_data_found)
+            else:
+                return (f"No specific data found for the date {query_date.strftime('%Y-%m-%d')} in the dataset.", is_actual_data_found)
+
+        except ValueError:
+            return (f"I couldn't understand the date '{date_str}' from your query.", is_actual_data_found)
+        except Exception as e:
+            logger.error(f"Error during data lookup on {date_str}: {e}")
+            return ("An error occurred while trying to retrieve the specific data.", is_actual_data_found)
+            
+    elif query_type in ["average", "trend", "comparison"]:
+        return (f"I understand you're asking about {query_type}, but that feature isn't implemented yet.", is_actual_data_found)
+        
+    else: # 'other', null, or unhandled type
+         logger.info(f"LLM classified query as '{query_type or 'other/null'}', no specific data retrieval triggered.")
+         return (None, is_actual_data_found) # No specific data/info to add
+
+# --- Updated Gemini API Call Logic --- 
+MAX_HISTORY_LENGTH = 20 # Max number of *messages* (user + model) to keep in history buffer
 
 async def call_gemini_api_with_history(session_id: str, user_message: str) -> str:
-    """Calls the Gemini API using conversation history stored in memory."""
+    """Calls the Gemini API using conversation history and RAG context."""
     if not model:
         logger.error("call_gemini_api_with_history called but model is not initialized.")
         return "AI Service not configured or API key missing."
 
-    # Get or initialize history, ensure it's in Gemini format
-    session_history = chat_histories.setdefault(session_id, [])
+    # 1. Perform RAG query using LLM parser
+    retrieved_info_str, specific_data_was_found = query_user_data_with_llm(
+        user_message, 
+        user_data_df.columns.tolist() if user_data_df is not None else []
+    )
 
-    # Append the new user message to the history *before* potentially trimming
-    # Gemini format: list of {"role": "user/model", "parts": ["content"]}
+    # 2. Get current session history
+    session_history = chat_histories.get(session_id, [])
+
+    # 3. Construct the context for the API
+    # Always include the base system prompt
+    context_messages = [
+        {"role": "user", "parts": [SYSTEM_PROMPT]},
+        {"role": "model", "parts": ["Okay, I understand my role and will use the provided data context to answer questions about the user's health data."]}
+    ]
+
+    # Add specifically retrieved data/info *if* it was generated
+    if retrieved_info_str:
+        context_messages.extend([
+            # Use a clear prefix indicating this is direct data/info for the query
+            # Instruct the AI on HOW to use it and what NOT to output
+            # Use a single triple-quoted f-string for multi-line content
+            {"role": "user", "parts": [
+                f"""INTERNAL CONTEXT ONLY (DO NOT mention this phrase or the raw data format to the user):
+Based on the user's query, the following relevant data/information was retrieved:
+```
+{retrieved_info_str}
+```
+TASK: Formulate your response to the user based ONLY on this retrieved information and the conversation history.
+IMPORTANT: DO NOT repeat the raw data format above in your response. State the key findings in a natural sentence."""
+                ]},
+            # Model's acknowledgment (can potentially be omitted if instructions are clear enough)
+            {"role": "model", "parts": ["Okay, I will use the provided internal context to formulate a natural response to the user without mentioning the retrieval process or showing the raw data format."]}
+        ])
+    # Conditionally add general summary if NO specific data was retrieved this turn
+    elif not specific_data_was_found: # Add summary only if no specific data found
+        context_messages.extend([
+            {"role": "user", "parts": [f"General Data Summary:\n```\n{user_data_summary}\n```"]},
+            {"role": "model", "parts": ["Understood. I have the general data summary available if needed."]}
+        ])
+    
+    # Combine context, history, and the new user message
+    full_history_for_api = context_messages + session_history
     current_user_message_formatted = {"role": "user", "parts": [user_message]}
-    session_history.append(current_user_message_formatted)
+    full_history_for_api.append(current_user_message_formatted)
 
-    # Trim history if it gets too long (based on total messages, not turns)
-    if len(session_history) > MAX_HISTORY_LENGTH:
-        # Keep the last MAX_HISTORY_LENGTH messages
-        session_history = session_history[-MAX_HISTORY_LENGTH:]
-        logger.info(f"Trimmed history for session {session_id} to {len(session_history)} messages.")
+    # 4. Trim the combined history (if needed) 
+    if len(full_history_for_api) > MAX_HISTORY_LENGTH:
+        num_context_messages = len(context_messages) 
+        num_history_to_keep = MAX_HISTORY_LENGTH - num_context_messages - 1 
+        if num_history_to_keep < 0: num_history_to_keep = 0 
+        start_index = len(session_history) - num_history_to_keep
+        if start_index < 0: start_index = 0
+        trimmed_session_history = session_history[start_index:]
+        full_history_for_api = context_messages + trimmed_session_history + [current_user_message_formatted]
+        logger.info(f"Trimmed full history for session {session_id} before API call.")
 
-    # Update the stored history (important after trimming and before API call)
-    chat_histories[session_id] = session_history
-
-    # Prepare history for the API call (exclude the latest user message for start_chat)
-    history_for_api = session_history[:-1]
-
-    logger.debug(f"Session {session_id} History sending to API (len {len(history_for_api)}): {history_for_api}")
-    logger.debug(f"Session {session_id} Current message: {current_user_message_formatted}")
+    # 5. Prepare history for the start_chat method 
+    history_for_start_chat = full_history_for_api[:-1]
+    
+    logger.debug(f"Session {session_id} History for start_chat (len {len(history_for_start_chat)}): {history_for_start_chat}")
+    logger.debug(f"Session {session_id} Current message parts: {current_user_message_formatted['parts']}")
 
     try:
-        # Start chat with the history *excluding* the latest user turn
-        chat = model.start_chat(history=history_for_api)
-        
-        # Send the *latest* user message's content
+        # 6. Call Gemini API 
+        chat = model.start_chat(history=history_for_start_chat)
         response = await chat.send_message_async(current_user_message_formatted['parts'])
         ai_response_content = response.text
         logger.info(f"Gemini Response received for session {session_id}")
 
-        # Append AI response to history *after* successful call
+        # 7. Update *session* history 
+        session_history.append(current_user_message_formatted)
         ai_response_formatted = {"role": "model", "parts": [ai_response_content]}
         session_history.append(ai_response_formatted)
 
-        # Update the global store again with the AI response included
-        # Trim again *after* adding AI response if needed (though trimming before user msg is common)
         if len(session_history) > MAX_HISTORY_LENGTH:
-             session_history = session_history[-MAX_HISTORY_LENGTH:]
-        chat_histories[session_id] = session_history
-        logger.debug(f"Session {session_id} History updated with AI response (len {len(session_history)})")
+            session_history = session_history[-MAX_HISTORY_LENGTH:]
+            logger.info(f"Trimmed stored session history for {session_id} to {len(session_history)} messages.")
+
+        chat_histories[session_id] = session_history 
 
         return ai_response_content
 
