@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Regression Insights</title>
+    <link rel="stylesheet" href="/static/style.css"> <!-- Link to main CSS -->
+    <style>
+        .container {
+            max-width: 95%; /* Wider container */
+            margin: 20px auto;
+            padding: 20px;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+         nav {
+            padding: 10px 0;
+            text-align: center; 
+            margin-bottom: 20px;
+         }
+         nav a {
+             margin: 0 15px;
+             text-decoration: none;
+             color: #007bff; 
+         }
+         nav a:hover {
+             text-decoration: underline;
+         }
+         pre {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 15px;
+            border-radius: 4px;
+            white-space: pre-wrap; /* Wrap long lines */
+            word-wrap: break-word; /* Break words if needed */
+            font-size: 0.9em;
+            margin-top: 10px;
+         }
+         .analysis-block {
+             margin-bottom: 20px;
+             padding-bottom: 15px;
+             border-bottom: 1px solid #eee;
+         }
+         .analysis-block:last-child {
+             border-bottom: none;
+         }
+         .status-success { color: green; }
+         .status-skipped { color: orange; }
+         .status-failed, .status-error { color: red; }
+
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav>
+            <a href="/">Chat</a>
+            <a href="/home">Home (Averages)</a>
+            <a href="/insights">Insights (Regression)</a>
+        </nav>
+        <h1>Regression Analysis Insights</h1>
+        <div id="insightsContainer">
+            <p>Loading insights...</p>
+            <!-- Results will be inserted here -->
+        </div>
+    </div>
+
+    <script src="/static/insights.js"></script>
+</body>
+</html> 

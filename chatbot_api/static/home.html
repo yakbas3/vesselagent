@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Averages</title>
+    <link rel="stylesheet" href="/static/style.css"> <!-- Link to main CSS -->
+    <style>
+        /* Simple table styling */
+        table {
+            width: 90%;
+            margin: 20px auto;
+            border-collapse: collapse;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        .container {
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+         nav {
+            padding: 10px 0;
+            text-align: center; 
+            margin-bottom: 20px;
+         }
+         nav a {
+             margin: 0 15px;
+             text-decoration: none;
+             color: #007bff; 
+         }
+         nav a:hover {
+             text-decoration: underline;
+         }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav>
+            <a href="/">Chat</a>
+            <a href="/home">Home (Averages)</a>
+            <a href="/insights">Insights (Regression)</a>
+        </nav>
+        <h1>Average Health Data</h1>
+        <div id="averagesTableContainer">
+            <p>Loading averages...</p>
+            <!-- Table will be inserted here by JavaScript -->
+        </div>
+    </div>
+
+    <script src="/static/home.js"></script>
+</body>
+</html> 

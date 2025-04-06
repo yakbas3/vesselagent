@@ -5,6 +5,7 @@ from app.core.config import settings
 import pandas as pd
 import io
 import logging
+import glob
 
 # --- Global In-Memory Store ---
 # Warning: This data is lost if the server restarts!
@@ -73,6 +74,37 @@ except Exception as e:
     logger.error(f"Fatal Error loading or processing data from {data_file_path}: {e}", exc_info=True)
     user_data_summary = f"Error: Could not process user data file. Error: {e}"
 # ---------------------------------------------------
+
+# --- Load Research Context ---
+RESEARCH_CONTEXT = ""
+research_files_dir = ".." # Directory relative to app/state.py where .txt files are
+
+try:
+    txt_files = glob.glob(os.path.join(research_files_dir, "*.txt"))
+    # Filter out requirements.txt if it's picked up
+    txt_files = [f for f in txt_files if os.path.basename(f) != 'requirements.txt']
+    
+    if not txt_files:
+        logger.warning(f"No relevant .txt research files found in {os.path.abspath(research_files_dir)}")
+        RESEARCH_CONTEXT = "No research context files were loaded."
+    else:
+        logger.info(f"Found research files: {txt_files}")
+        content_list = []
+        for file_path in txt_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    filename = os.path.basename(file_path)
+                    # Optional: Add less verbose markers
+                    content_list.append(f"### Research: {filename} ###\n{f.read()}\n### End: {filename} ###")
+            except Exception as read_e:
+                logger.error(f"Error reading research file {file_path}: {read_e}")
+                content_list.append(f"### Error loading research from {os.path.basename(file_path)} ###")
+        RESEARCH_CONTEXT = "\n\n".join(content_list)
+        logger.info("Successfully loaded research context.")
+except Exception as glob_e:
+    logger.error(f"Error finding research files: {glob_e}")
+    RESEARCH_CONTEXT = "Error occurred while trying to locate research context files."
+# ---------------------------
 
 # --- Configure Gemini --- 
 # Use the API key from settings

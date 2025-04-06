@@ -8,6 +8,9 @@ import logging
 from typing import List, Tuple, Optional
 import json
 import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split # Potentially useful, but not used in this simple version
+from sklearn.metrics import r2_score # To evaluate the model fit
 
 # Load environment variables from .env file BEFORE importing other modules
 load_dotenv()
@@ -15,7 +18,11 @@ load_dotenv()
 # Now import modules that might depend on environment variables (like state which initializes Gemini)
 from app.api.endpoints import chat as chat_router
 from app.core.config import settings
-from app.state import chat_histories, model, user_data_df, date_col_found, user_data_summary
+# Import state variables explicitly, including RESEARCH_CONTEXT
+from app.state import (
+    chat_histories, model, user_data_df, 
+    date_col_found, user_data_summary, RESEARCH_CONTEXT
+)
 from app import schemas
 
 # --- Configure Logging ---
@@ -36,14 +43,26 @@ app = FastAPI(title="Hackathon Health Chatbot API (Web UI)", version="0.3.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- System Prompt Definition ---
+BASIC_HEALTH_RULES = """
+Basic Health Rules for Interpretation:
+1. Sleep Duration (minutes): < 360 is insufficient; 420-480 is optimal; > 480 may indicate issues.
+2. Steps: < 3000 is low; >= 3000 (~30 mins walking) is beneficial.
+3. Sleep Quality: Lower scores indicate poor rest; higher scores indicate restorative sleep.
+4. Heart Rate (bpm): Unusually high resting bpm can indicate stress/health issues.
+5. Stress Levels: High scores are negative; lower scores are preferable.
+6. Screen Time (minutes): > 240-360 (4-6 hrs) can be excessive; < 120-180 (2-3 hrs) is generally better.
+7. Mood/Events: Higher ratio of positive to negative events is good; low mood/high negative events suggest areas for improvement.
+"""
+
 SYSTEM_PROMPT = (
-    "You are a helpful and knowledgeable health assistant. "
-    "Your goal is to analyze the user's biomarker data and conversation history to answer questions, identify trends, and provide concise, data-driven insights. "
-    "For questions about specific data points (e.g., metrics on a certain date), relevant data will be retrieved and provided in the context prefixed with \'Specifically retrieved data...\'. "
-    "You MUST prioritize and use this specifically retrieved data to answer the question it pertains to. State the data found clearly in your answer. "
-    "If the retrieved information indicates \'No data found\' or an error, explain that to the user. "
-    "If no specific data is retrieved for the query, you can use the general data summary (if provided previously) or state that you need more information or cannot answer from the summary alone. "
-    "Focus on accuracy. Do not provide medical diagnoses. Be friendly."
+    f"You are a helpful and knowledgeable health assistant. Your goal is to analyze the user's biomarker data and conversation history to answer questions, identify trends, and provide concise, data-driven insights.\n\n"
+    f"**Interpretation Guidelines:**\nUse the following basic health rules as a guideline when interpreting the data:\n{BASIC_HEALTH_RULES}\n\n"
+    f"**Research Context (Refer to this for credibility):**\nHere is some background research information on various health metrics:\n{RESEARCH_CONTEXT}\n\n"
+    f"**Your Task:**\n"
+    f"1. **Analyze & Advise:** When asked for general recommendations or analysis, actively apply the 'Basic Health Rules' to the data (summary or specific retrieved data) to identify potential areas for improvement or positive trends. Offer general, actionable advice based on these observations. When giving advice or interpretations, refer to the 'Research Context' where relevant to add credibility (e.g., 'Research suggests that X is important for Y...', 'Studies show that aiming for Z is beneficial...').\n"
+    f"2. **Specific Data Queries:** For questions about specific data points (e.g., metrics on a certain date), relevant data will be retrieved and provided. Prioritize using this specific data. State the data found clearly and interpret it using the 'Basic Health Rules' and relevant 'Research Context'.\n"
+    f"3. **Handle Missing Data:** If retrieved information indicates 'No data found' or an error, explain that. If specific data isn't available for a general question, analyze the provided data summary using the rules and research.\n"
+    f"4. **Tone & Scope:** Be analytical and provide insights. Clearly state this is general information based on data/rules/research, NOT a medical diagnosis. Be friendly and supportive.\n"
 )
 # ------------------------------
 
@@ -241,7 +260,7 @@ IMPORTANT: DO NOT repeat the raw data format above in your response. State the k
 
 # --- API Endpoints ---
 
-# Serve the HTML frontend
+# Serve the HTML frontend for chat
 @app.get("/", response_class=HTMLResponse)
 async def get_chat_ui(request: Request):
     """Serves the main chat interface HTML file."""
@@ -256,6 +275,44 @@ async def get_chat_ui(request: Request):
     except Exception as e:
         logger.error(f"Error reading {html_file_path}: {e}")
         raise HTTPException(status_code=500, detail="Could not load chat interface.")
+
+# Serve the HTML frontend for home/averages
+@app.get("/home", response_class=HTMLResponse)
+async def get_home_ui(request: Request):
+    """Serves the home page HTML file."""
+    html_file_path = "static/home.html"
+    try:
+        with open(html_file_path, "r") as f:
+            return HTMLResponse(content=f.read(), status_code=200)
+    except FileNotFoundError:
+        logger.error(f"{html_file_path} not found! Ensure it exists relative to where you run uvicorn.")
+        raise HTTPException(status_code=404, detail="Home page file (home.html) not found.")
+    except Exception as e:
+        logger.error(f"Error reading {html_file_path}: {e}")
+        raise HTTPException(status_code=500, detail="Could not load home page interface.")
+
+# API endpoint to get data averages
+@app.get("/home_data") # Returns JSON data
+async def get_home_data():
+    """Calculates and returns the average of numeric columns in the dataset."""
+    logger.info("Request received for /home_data")
+    if user_data_df is None:
+        logger.warning("/home_data requested but DataFrame not loaded.")
+        raise HTTPException(status_code=503, detail="User data is not loaded yet.")
+
+    try:
+        # Select only numeric columns (excluding potential non-numeric like date/time if not index)
+        numeric_df = user_data_df.select_dtypes(include='number')
+        averages = numeric_df.mean()
+        
+        # Convert to dictionary and handle potential NaN values for JSON compatibility
+        averages_dict = averages.where(pd.notnull(averages), None).to_dict()
+        
+        logger.info(f"Calculated averages: {averages_dict}")
+        return averages_dict
+    except Exception as e:
+        logger.error(f"Error calculating averages in /home_data: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error calculating data averages.")
 
 # Handle chat messages from the frontend
 @app.post("/chat", response_model=schemas.chat.ChatResponse)
@@ -298,6 +355,124 @@ async def get_active_sessions():
 # Remove the old root endpoint as '/' now serves the HTML
 # @app.get("/", tags=["Root"])
 # async def read_root(): ... 
+
+# --- API Endpoint for Regression Insights --- 
+@app.get("/insights") # Returns JSON data
+async def get_regression_insights():
+    """Performs predefined regression analyses on the dataset and returns results."""
+    logger.info("Request received for /insights")
+    if user_data_df is None:
+        logger.warning("/insights requested but DataFrame not loaded.")
+        raise HTTPException(status_code=503, detail="User data is not loaded yet.")
+
+    # --- Define Regression Scenarios --- 
+    # List of dictionaries: {target: str, predictors: List[str]}
+    scenarios = [
+        {
+            "target": "mood",
+            "predictors": ["sleepquality", "sleepduration", "steps", "stress", "positiveevents", "negativeevents", "temperature", "aqi"]
+        },
+        {
+            "target": "stress",
+            "predictors": ["sleepquality", "sleepduration", "bpm", "steps", "screentime", "temperature", "aqi", "negativeevents"]
+        },
+        {
+             "target": "sleepquality", # Example: Predicting sleep quality
+             "predictors": ["stress", "bpm", "steps", "screentime", "temperature", "aqi", "positiveevents", "negativeevents"]
+        }
+        # Add more scenarios as needed
+    ]
+
+    results_list = []
+
+    for scenario in scenarios:
+        target_var = scenario["target"]
+        predictor_vars = scenario["predictors"]
+        analysis_info = {
+            "analysis_name": f"Predicting '{target_var}'",
+            "target_variable": target_var,
+            "predictor_variables": predictor_vars,
+            "status": "Failed",
+            "details": None
+        }
+
+        try:
+            # Check if all needed columns exist
+            required_cols = [target_var] + predictor_vars
+            missing_cols = [col for col in required_cols if col not in user_data_df.columns]
+            if missing_cols:
+                raise ValueError(f"Missing required columns: {missing_cols}")
+
+            # Select relevant data and drop rows with NaNs for this specific analysis
+            analysis_df = user_data_df[required_cols].dropna()
+
+            if len(analysis_df) < 10: # Arbitrary threshold for minimum data points
+                 raise ValueError(f"Insufficient data ({len(analysis_df)} rows) after dropping NaNs.")
+            
+            # Prepare features (X) and target (y)
+            X = analysis_df[predictor_vars]
+            y = analysis_df[target_var]
+
+            # --- Train Linear Regression Model --- 
+            model_lr = LinearRegression()
+            model_lr.fit(X, y)
+
+            # --- Extract Results --- 
+            intercept = model_lr.intercept_
+            coefficients = dict(zip(predictor_vars, model_lr.coef_))
+            r_squared = model_lr.score(X, y) # R-squared value
+
+            # --- Generate Simple Interpretation --- 
+            interpretation = f"Linear Regression trying to predict '{target_var}'. "
+            interpretation += f"The model explains {r_squared:.2%} of the variance in '{target_var}' (R-squared). "
+            interpretation += "Coefficients suggest how much '{target_var}' changes on average for a one-unit increase in each predictor, holding others constant: "
+            coeff_strs = [f"'{p}': {c:.3f}" for p, c in coefficients.items()]
+            interpretation += ", ".join(coeff_strs) + ". "
+            interpretation += f"The base value (intercept) when all predictors are zero is {intercept:.3f}. "
+            if r_squared < 0.1: # Example threshold for poor fit
+                 interpretation += "Note: The low R-squared suggests this linear model doesn't capture much of the relationship."
+            elif r_squared > 0.5:
+                 interpretation += "Note: The R-squared indicates a potentially meaningful linear relationship."
+            
+            # Update analysis info with results
+            analysis_info["status"] = "Success"
+            analysis_info["details"] = {
+                "model_type": "Linear Regression",
+                "r_squared": round(r_squared, 4),
+                "intercept": round(intercept, 4),
+                "coefficients": {p: round(c, 4) for p, c in coefficients.items()},
+                "interpretation": interpretation,
+                "rows_used": len(analysis_df)
+            }
+            
+        except ValueError as ve:
+            logger.warning(f"Skipping regression for '{target_var}': {ve}")
+            analysis_info["status"] = "Skipped"
+            analysis_info["details"] = str(ve)
+        except Exception as e:
+            logger.error(f"Error during regression analysis for '{target_var}': {e}", exc_info=True)
+            analysis_info["status"] = "Error"
+            analysis_info["details"] = str(e)
+        
+        results_list.append(analysis_info)
+
+    logger.info(f"Completed {len(results_list)} regression analyses.")
+    return {"regression_insights": results_list}
+
+# --- Route for Insights HTML Page ---
+@app.get("/insights", response_class=HTMLResponse)
+async def get_insights_ui(request: Request):
+    """Serves the insights page HTML file."""
+    html_file_path = "static/insights.html"
+    try:
+        with open(html_file_path, "r") as f:
+            return HTMLResponse(content=f.read(), status_code=200)
+    except FileNotFoundError:
+        logger.error(f"{html_file_path} not found! Ensure it exists relative to where you run uvicorn.")
+        raise HTTPException(status_code=404, detail="Insights page file (insights.html) not found.")
+    except Exception as e:
+        logger.error(f"Error reading {html_file_path}: {e}")
+        raise HTTPException(status_code=500, detail="Could not load insights page interface.")
 
 # To run locally:
 # pip install -r requirements.txt
